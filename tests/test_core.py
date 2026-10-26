@@ -372,6 +372,184 @@ def test_stft_preallocate_undersize(center, n_fft, hop_length, N, rng):
 
 
 @pytest.mark.parametrize("center", [False, True])
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize(
+    "n_fft, win_length", [(256, None), (501, None), (512, 400)]
+)
+def test_multitaper_stft(y_22050, n_fft, win_length, center, adaptive):
+    hop_length = n_fft // 4
+    power, dof = librosa.multitaper_stft(
+        y_22050,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        time_bandwidth=3.0,
+        n_tapers=5,
+        center=center,
+        adaptive=adaptive,
+    )
+
+    if win_length is None:
+        win_length = n_fft
+
+    # Outputs live on the same time-frequency grid as stft
+    D = librosa.stft(
+        y_22050,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        center=center,
+    )
+    assert power.shape == D.shape
+    assert dof.shape == D.shape
+    assert power.shape[-2] == n_fft // 2 + 1
+    if center:
+        assert power.shape[-1] == 1 + len(y_22050) // hop_length
+    else:
+        assert power.shape[-1] == 1 + (len(y_22050) - n_fft) // hop_length
+
+    assert np.isfinite(power).all()
+    assert np.isfinite(dof).all()
+    assert np.all(power >= 0)
+    # Effective degrees of freedom are bounded by 2 and 2 * n_tapers
+    assert np.all(dof >= 2 - 1e-5)
+    assert np.all(dof <= 2 * 5 + 1e-5)
+
+    # Direct reference computation using the same DPSS tapers
+    tapers, eigenvalues = scipy.signal.windows.dpss(
+        win_length, 3.0, Kmax=5, return_ratios=True
+    )
+    taper_power = np.stack(
+        [
+            np.abs(
+                librosa.stft(
+                    y_22050,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    win_length=win_length,
+                    window=taper,
+                    center=center,
+                )
+            )
+            ** 2
+            for taper in tapers
+        ]
+    )
+
+    if not adaptive:
+        # Uniform estimate is a plain average over tapers ...
+        assert np.allclose(power, taper_power.mean(axis=0), atol=1e-6)
+        # ... with constant, eigenvalue-based degrees of freedom
+        expected_dof = 2 * eigenvalues.sum() ** 2 / np.sum(eigenvalues**2)
+        assert np.allclose(dof, expected_dof)
+    else:
+        # Independent implementation of the Thomson adaptive fixed point
+        spectrum = (taper_power[0] + taper_power[1]) / (
+            eigenvalues[0] + eigenvalues[1]
+        )
+        lam = eigenvalues.reshape((5, 1, 1))
+        for _ in range(10):
+            weights = spectrum / (spectrum * lam + (1.0 - lam))
+            weighted_lambda = weights**2 * lam
+            spectrum = (
+                (weighted_lambda * taper_power).sum(axis=0)
+                / weighted_lambda.sum(axis=0)
+            )
+        weighted_lambda = weights * lam
+        expected_dof = (
+            2
+            * weighted_lambda.sum(axis=0) ** 2
+            / np.sum(weighted_lambda**2, axis=0)
+        )
+        assert np.allclose(power, spectrum, atol=1e-5)
+        assert np.allclose(dof, expected_dof, atol=1e-5)
+
+
+@pytest.mark.parametrize("center", [False, True])
+def test_multitaper_stft_multichannel(center, rng):
+    y = rng.standard_normal(size=(2, 3, 8192))
+
+    power, dof = librosa.multitaper_stft(
+        y, n_fft=256, hop_length=64, center=center
+    )
+
+    # Leading channel dimensions are preserved independently
+    power_mono_ref = []
+    dof_mono_ref = []
+    for i in range(2):
+        for j in range(3):
+            p, d = librosa.multitaper_stft(
+                y[i, j], n_fft=256, hop_length=64, center=center
+            )
+            power_mono_ref.append(p)
+            dof_mono_ref.append(d)
+
+    assert power.shape == (2, 3, 129, power.shape[-1])
+    assert np.allclose(
+        power, np.asarray(power_mono_ref).reshape(power.shape), atol=1e-6
+    )
+    assert np.allclose(
+        dof, np.asarray(dof_mono_ref).reshape(dof.shape), atol=6e-6
+    )
+
+
+def test_multitaper_stft_default_tapers():
+    y = np.zeros(2048, dtype=np.float32)
+    # floor(2 * 3.0) - 1 = 5 tapers by default
+    p_default, d_default = librosa.multitaper_stft(y, n_fft=256)
+    p_explicit, d_explicit = librosa.multitaper_stft(
+        y, n_fft=256, time_bandwidth=3.0, n_tapers=5
+    )
+    assert np.array_equal(p_default, p_explicit)
+    assert np.array_equal(d_default, d_explicit)
+
+    # Half-integer time-bandwidth product: floor(2 * 2.5) - 1 = 4
+    p_25, _ = librosa.multitaper_stft(
+        y, n_fft=256, time_bandwidth=2.5, n_tapers=4
+    )
+    p_25_default, _ = librosa.multitaper_stft(y, n_fft=256, time_bandwidth=2.5)
+    assert np.array_equal(p_25, p_25_default)
+
+
+def test_multitaper_stft_zero_signal():
+    power, dof = librosa.multitaper_stft(
+        np.zeros(4098, dtype=np.float32), n_fft=512
+    )
+    assert np.all(power == 0)
+    assert np.isfinite(dof).all()
+    assert np.all(dof > 0)
+
+
+def test_multitaper_stft_dtype():
+    y = np.random.default_rng(0).standard_normal(2048)
+    p32, d32 = librosa.multitaper_stft(y.astype(np.float32), n_fft=256)
+    p64, d64 = librosa.multitaper_stft(y.astype(np.float64), n_fft=256)
+    assert p32.dtype == np.float32 and d32.dtype == np.float32
+    assert p64.dtype == np.float64 and d64.dtype == np.float64
+    assert np.allclose(p32, p64, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(time_bandwidth=3.0, n_tapers=7),  # exceeds 2 * NW = 6
+        dict(time_bandwidth=0.0, n_tapers=1),
+        dict(time_bandwidth=3.0, n_tapers=0),
+    ],
+)
+@pytest.mark.xfail(raises=librosa.ParameterError)
+def test_multitaper_stft_bad_params(kwargs):
+    y = np.zeros(2048, dtype=np.float32)
+    librosa.multitaper_stft(y, n_fft=256, **kwargs)
+
+
+@pytest.mark.xfail(raises=librosa.ParameterError)
+def test_multitaper_stft_toolong_left():
+    y = np.zeros(128, dtype=np.float32)
+    librosa.multitaper_stft(y, n_fft=2048, center=False)
+
+
+@pytest.mark.parametrize("center", [False, True])
 @pytest.mark.parametrize(
     "n_fft, hop_length",
     [(1023, 128), (1023, 129), (1023, 256), (2048, 512), (2048, 2048)],

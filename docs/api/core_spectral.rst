@@ -7,6 +7,7 @@ Time and frequency representations
 
     stft
     istft
+    multitaper_stft
     reassigned_spectrogram
 
     cqt

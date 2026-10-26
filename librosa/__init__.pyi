@@ -63,6 +63,7 @@ from .core import midi_to_svara_h as midi_to_svara_h
 from .core import mu_compress as mu_compress
 from .core import mu_expand as mu_expand
 from .core import multi_frequency_weighting as multi_frequency_weighting
+from .core import multitaper_stft as multitaper_stft
 from .core import note_to_hz as note_to_hz
 from .core import note_to_midi as note_to_midi
 from .core import note_to_svara_c as note_to_svara_c

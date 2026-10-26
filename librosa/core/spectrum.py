@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 __all__ = [
     "stft",
     "istft",
+    "multitaper_stft",
     "magphase",
     "iirt",
     "reassigned_spectrogram",
@@ -641,6 +642,323 @@ def __overlap_add(y, ytmp, hop_length):
             N = y.shape[-1] - sample
 
         y[..., sample : (sample + N)] += ytmp[..., :N, frame]
+
+
+def __multitaper_combine(
+    power: np.ndarray,
+    eigenvalues: np.ndarray,
+    *,
+    adaptive: bool = True,
+    n_iterations: int = 10,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Combine taper-wise power spectra into a multitaper power estimate.
+
+    Parameters
+    ----------
+    power : np.ndarray [shape=(n_tapers, ..., n_freqs, n_frames), dtype=float]
+        Taper-wise power spectra ``|Y_k|**2``.
+    eigenvalues : np.ndarray [shape=(n_tapers,)]
+        Concentration ratios (eigenvalues) of the tapers.
+    adaptive : bool
+        If ``True``, use the Thomson (1982) adaptively weighted estimate;
+        otherwise use a uniform average over tapers.
+    n_iterations : int
+        Number of fixed-point iterations for the adaptive weights.
+
+    Returns
+    -------
+    spectrum : np.ndarray [shape=(..., n_freqs, n_frames)]
+        Combined multitaper power spectrum estimate.
+    degrees_of_freedom : np.ndarray [shape=(..., n_freqs, n_frames)]
+        Effective degrees of freedom at each time-frequency bin.
+    """
+    n_tapers = power.shape[0]
+    lam = eigenvalues.reshape((n_tapers,) + (1,) * (power.ndim - 1))
+
+    # Degrees of freedom of the uniform (non-adaptive) estimate, used both
+    # directly for adaptive=False and as a fallback for zero-power bins.
+    uniform_dof = np.asarray(
+        2.0 * eigenvalues.sum() ** 2 / np.sum(eigenvalues**2)
+    )
+
+    if not adaptive:
+        spectrum = power.mean(axis=0)
+        degrees_of_freedom = np.broadcast_to(
+            uniform_dof, spectrum.shape
+        ).copy()
+        return spectrum, degrees_of_freedom
+
+    if n_tapers == 1:
+        spectrum = power[0]
+        degrees_of_freedom = np.broadcast_to(
+            2.0 * eigenvalues[0], spectrum.shape
+        ).copy()
+        return spectrum, degrees_of_freedom
+
+    # Initialize the estimate from the first two (best-concentrated) tapers
+    spectrum = (power[0] + power[1]) / (eigenvalues[0] + eigenvalues[1])
+
+    # Thomson (1982) adaptive weighting, eqs. (13.13)-(13.15) in Percival &
+    # Walden (1993):
+    #   w_k(f) = S(f) / (S(f) * lambda_k + (1 - lambda_k))
+    # iterated against the weighted multitaper estimate.
+    for _ in range(n_iterations):
+        weights = spectrum / (spectrum * lam + (1.0 - lam))
+        weighted_lambda = weights**2 * lam
+        denominator = weighted_lambda.sum(axis=0)
+        numerator = (weighted_lambda * power).sum(axis=0)
+        spectrum = np.divide(
+            numerator,
+            denominator,
+            out=np.zeros_like(denominator),
+            where=denominator > 0,
+        )
+
+    # Effective degrees of freedom: 2 * (sum_k w_k lambda_k)^2 /
+    # sum_k (w_k lambda_k)^2.  Bins with zero power (zero denominator) fall
+    # back to the uniform-estimate degrees of freedom.
+    weighted_lambda = weights * lam
+    dof_denominator = np.sum(weighted_lambda**2, axis=0)
+    degrees_of_freedom = np.divide(
+        2.0 * np.sum(weighted_lambda, axis=0) ** 2,
+        dof_denominator,
+        out=np.broadcast_to(uniform_dof, dof_denominator.shape).copy(),
+        where=dof_denominator > 0,
+    )
+
+    return spectrum, degrees_of_freedom
+
+
+@cache(level=20)
+def multitaper_stft(
+    y: np.ndarray,
+    *,
+    n_fft: int = 2048,
+    hop_length: int | None = None,
+    win_length: int | None = None,
+    time_bandwidth: float = 3.0,
+    n_tapers: int | None = None,
+    center: bool = True,
+    adaptive: bool = True,
+    dtype: DTypeLike | None = None,
+    pad_mode: _PadModeSTFT = "constant",
+) -> tuple[np.ndarray, np.ndarray]:
+    r"""DPSS (Slepian) multi-taper short-time power spectrum.
+
+    Given a time-bandwidth product :math:`NW` and a number of tapers
+    :math:`K`, this function computes :math:`K` short-time Fourier transforms
+    of ``y`` using discrete prolate spheroidal sequences (DPSS, a.k.a. Slepian
+    tapers), and combines the taper-wise power spectra into a single adaptive
+    multitaper power spectrum estimate.  Multi-taper estimation reduces the
+    variance and window-to-window leakage fluctuations of a single-window
+    STFT power spectrum by averaging over :math:`K` mutually orthogonal,
+    jointly optimized data tapers.
+
+    When ``adaptive=True`` (default), the tapers are combined with the
+    frequency-dependent adaptive weights of Thomson [#]_, down-weighting
+    poorly concentrated tapers where the local spectral estimate is small.
+    The function also returns the effective degrees of freedom at each
+    time-frequency bin, which follows from the applied weights and the
+    concentration ratios (eigenvalues) of the tapers.
+
+    Each taper is applied through `stft`, so the resulting time-frequency
+    grid is identical to that of `stft`: the same ``n_fft`` frequency bins,
+    the same frame positions (including ``center=True`` center alignment and
+    edge padding), and full multi-channel support.
+
+    .. [#] Thomson, D. J. (1982). "Spectrum estimation and harmonic
+        analysis." Proceedings of the IEEE, 70(10), 1055--1096.
+        See also Percival, D. B., & Walden, A. T. (1993), *Spectral
+        Analysis for Physical Applications*, Cambridge University Press.
+
+    Parameters
+    ----------
+    y : np.ndarray [shape=(..., n)], real-valued
+        input signal. Multi-channel is supported.
+
+    n_fft : int > 0 [scalar]
+        length of the FFT window, see `stft`.
+        The number of frequency rows in the outputs is ``(1 + n_fft/2)``.
+
+    hop_length : int > 0 [scalar]
+        number of audio samples between adjacent columns, see `stft`.
+
+        If unspecified, defaults to ``win_length // 4``.
+
+    win_length : int <= n_fft [scalar]
+        length of the DPSS tapers. Each taper is zero-padded on both sides
+        so that it is centered within the ``n_fft`` frame, see `stft`.
+
+        If unspecified, defaults to ``win_length = n_fft``.
+
+    time_bandwidth : float > 0 [scalar]
+        Time-bandwidth product :math:`NW` of the DPSS tapers, i.e., the
+        (approximate) half-bandwidth in bins of the main spectral lobe.
+        Typical values range from 2 to 4. Defaults to 3.0.
+
+    n_tapers : int > 0 or None
+        Number :math:`K` of DPSS tapers (also called the number of windows).
+        At most :math:`2 NW` tapers exist with good concentration; the
+        default is :math:`K = \lfloor 2 NW \rfloor - 1`, the standard choice
+        of well-concentrated tapers (e.g., 5 tapers for ``time_bandwidth=3``).
+
+    center : bool
+        If ``True``, the signal ``y`` is padded so that each output frame is
+        centered at ``y[t * hop_length]``. If ``False``, frames begin at
+        ``y[t * hop_length]``. See `stft`.
+
+    adaptive : bool
+        If ``True`` (default), combine the taper-wise power spectra using the
+        Thomson (1982) adaptive weights and return the corresponding
+        per-frequency effective degrees of freedom.
+
+        If ``False``, average the taper-wise power spectra uniformly and
+        report constant (eigenvalue-based) degrees of freedom.
+
+    dtype : np.dtype, optional
+        Complex numeric type for the per-taper STFTs. Default is inferred to
+        match the precision of the input signal, as in `stft`.
+
+    pad_mode : str or function
+        Padding mode used when ``center=True``; see `stft`.
+
+    Returns
+    -------
+    power : np.ndarray [shape=(..., 1 + n_fft/2, n_frames), dtype=real]
+        Multitaper power spectrum estimate. The DPSS tapers are unit-energy
+        normalized, so the absolute scale is not directly comparable to
+        ``np.abs(stft(y, window='hann'))**2``.
+    degrees_of_freedom : np.ndarray [shape=power.shape, dtype=real]
+        Effective degrees of freedom at each time-frequency bin (between 2
+        and ``2 * n_tapers``). With ``adaptive=True`` these vary per
+        frequency and frame according to the applied taper weights; with
+        ``adaptive=False`` they are constant. They can be used, e.g., to
+        construct confidence intervals for the spectral estimate.
+
+    See Also
+    --------
+    stft : Short-time Fourier transform
+    scipy.signal.windows.dpss : DPSS (Slepian) taper construction
+
+    Notes
+    -----
+    This function caches at level 20.
+
+    Examples
+    --------
+    >>> y = np.sin(2 * np.pi * 110 * np.arange(22050) / 22050)
+    >>> power, dof = librosa.multitaper_stft(y, n_fft=512)
+    >>> power.shape
+    (257, 173)
+    >>> dof.shape
+    (257, 173)
+
+    Using a time-bandwidth product of 4 with 7 tapers
+
+    >>> power_4_7, dof_4_7 = librosa.multitaper_stft(
+    ...     y, n_fft=512, time_bandwidth=4, n_tapers=7
+    ... )
+    >>> power_4_7.shape
+    (257, 173)
+    """
+    # By default, use the entire frame
+    if win_length is None:
+        win_length = n_fft
+
+    # Set the default hop, if it's not already specified
+    if hop_length is None:
+        hop_length = int(win_length // 4)
+    elif not util.is_positive_int(hop_length):
+        raise ParameterError(f"hop_length={hop_length} must be a positive integer")
+
+    # Check audio is valid
+    util.valid_audio(y)
+
+    if not np.isscalar(time_bandwidth) or time_bandwidth <= 0:
+        raise ParameterError(
+            f"time_bandwidth={time_bandwidth!r} must be a positive number"
+        )
+
+    max_tapers = int(np.floor(2.0 * time_bandwidth))
+    if n_tapers is None:
+        n_tapers = max(max_tapers - 1, 1)
+
+    if not util.is_positive_int(n_tapers):
+        raise ParameterError(f"n_tapers={n_tapers} must be a positive integer")
+
+    if n_tapers > 2.0 * time_bandwidth:
+        raise ParameterError(
+            f"n_tapers={n_tapers} must not exceed 2 * time_bandwidth="
+            f"{2.0 * time_bandwidth}"
+        )
+
+    try:
+        tapers, eigenvalues = scipy.signal.windows.dpss(
+            win_length,
+            time_bandwidth,
+            Kmax=n_tapers,
+            sym=True,
+            return_ratios=True,
+        )
+    except ValueError as exc:
+        raise ParameterError(
+            f"Failed to construct {n_tapers} DPSS tapers of length "
+            f"{win_length} with time-bandwidth product {time_bandwidth}: {exc}"
+        ) from exc
+
+    if dtype is None:
+        dtype = util.dtype_r2c(y.dtype)
+    real_dtype = util.dtype_c2r(dtype)
+
+    # Compute the per-taper power spectra by reusing stft, which preserves
+    # the exact framing, center alignment, padding and frequency grid.
+    power: np.ndarray | None = None
+
+    for k, taper in enumerate(tapers):
+        D = stft(
+            y,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+            window=taper,
+            center=center,
+            dtype=dtype,
+            pad_mode=pad_mode,
+        )
+        taper_power = D.real * D.real + D.imag * D.imag
+        if k == 0:
+            power = np.empty(
+                (n_tapers, *taper_power.shape), dtype=real_dtype
+            )
+        assert power is not None
+        power[k] = taper_power
+
+    assert power is not None
+
+    # Combine the tapers in column blocks.  The adaptive iteration is done
+    # in float64 regardless of the output precision for numerical stability.
+    spectrum = np.empty(power.shape[1:], dtype=real_dtype)
+    degrees_of_freedom = np.empty_like(spectrum)
+
+    n_columns = int(
+        util.MAX_MEM_BLOCK
+        // (np.prod(power.shape[:-1]) * np.dtype(np.float64).itemsize)
+    )
+    n_columns = max(n_columns, 1)
+
+    for bl_s in range(0, power.shape[-1], n_columns):
+        bl_t = min(bl_s + n_columns, power.shape[-1])
+        power_block = power[..., bl_s:bl_t].astype(np.float64, copy=False)
+
+        spectrum_block, dof_block = __multitaper_combine(
+            power_block, eigenvalues.astype(np.float64, copy=False),
+            adaptive=adaptive,
+        )
+
+        spectrum[..., bl_s:bl_t] = spectrum_block
+        degrees_of_freedom[..., bl_s:bl_t] = dof_block
+
+    return spectrum, degrees_of_freedom
 
 
 def __reassign_frequencies(

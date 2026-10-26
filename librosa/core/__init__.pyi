@@ -91,6 +91,7 @@ from .spectrum import griffinlim as griffinlim
 from .spectrum import iirt as iirt
 from .spectrum import istft as istft
 from .spectrum import magphase as magphase
+from .spectrum import multitaper_stft as multitaper_stft
 from .spectrum import pcen as pcen
 from .spectrum import perceptual_weighting as perceptual_weighting
 from .spectrum import phase_vocoder as phase_vocoder
